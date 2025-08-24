@@ -1,0 +1,12 @@
+[package]
+name = "tsudump"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gimli = "0.32.1"
+pdb = "0.8.0"
+clap = { version = "4.0", features = ["derive"] }
+memmap2 = "0.9"
+anyhow = "1.0"
+capstone = "0.12"
