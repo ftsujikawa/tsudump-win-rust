@@ -339,7 +339,15 @@ fn disassemble_text(
     limit: Option<usize>,
     use_va: bool,
     force_thumb: bool,
+    disasm_start: Option<u64>,
+    disasm_base_text: bool,
 ) -> Result<()> {
+    fn parse_hex_u64(s: &str) -> Option<u64> {
+        let s = s.trim();
+        let s = s.strip_prefix("0x").unwrap_or(s);
+        u64::from_str_radix(s, 16).ok()
+    }
+
     let mut file = File::open(file_path)
         .with_context(|| format!("ファイルを開けませんでした: {}", file_path))?;
 
@@ -357,10 +365,12 @@ fn disassemble_text(
     let is_pe32_plus = magic == 0x020b; // 64bit
     let image_base: u64;
     let entry_point_rva: u32;
+    let size_of_headers: u32;
     if magic == 0x010b {
         let opt: OptionalHeader32 = read_struct(&mut file)?;
         image_base = opt.image_base as u64;
         entry_point_rva = opt.address_of_entry_point;
+        size_of_headers = opt.size_of_headers;
         // 残り（データディレクトリ）スキップ
         let read_size = std::mem::size_of::<OptionalHeader32>() as i64;
         let remaining = (pe.size_of_optional_header as i64) - read_size;
@@ -369,6 +379,7 @@ fn disassemble_text(
         let opt: OptionalHeader64 = read_struct(&mut file)?;
         image_base = opt.image_base as u64;
         entry_point_rva = opt.address_of_entry_point;
+        size_of_headers = opt.size_of_headers;
         let read_size = std::mem::size_of::<OptionalHeader64>() as i64;
         let remaining = (pe.size_of_optional_header as i64) - read_size;
         if remaining > 0 { file.seek(SeekFrom::Current(remaining))?; }
@@ -393,38 +404,113 @@ fn disassemble_text(
             text_hdr = Some(sh);
         }
         let vstart = sh.virtual_address;
-        let vend = vstart.saturating_add(sh.size_of_raw_data.max(sh.virtual_size));
+        let vsize = if sh.virtual_size != 0 { sh.virtual_size } else { sh.size_of_raw_data };
+        let vend = vstart.saturating_add(vsize);
         if entry_point_rva >= vstart && entry_point_rva < vend {
             ep_hdr = Some(sh);
         }
     }
 
-    // 逆アセンブル対象セクションと開始RVAを決定（EP優先、なければ.textの頭）
-    let (target_sh, start_rva_in_image) = if let Some(h) = ep_hdr {
-        (h, entry_point_rva as u64)
+    // 逆アセンブル対象と開始RVAを決定
+    // - disasm_start があればそれを最優先
+    // - それ以外は disasm_base_text=true なら .text 先頭
+    // - それ以外は EP 優先（EPがヘッダー領域ならヘッダー。なければ.text先頭）
+    let mut target_sh: Option<SectionHeader> = None;
+    let start_rva_in_image: u64;
+    let mut in_headers = false;
+    if let Some(a) = disasm_start {
+        let rva = if use_va { a.saturating_sub(image_base) } else { a };
+        if rva < (size_of_headers as u64) {
+            in_headers = true;
+            start_rva_in_image = rva;
+        } else {
+            for sh in &section_list {
+                let vstart = sh.virtual_address as u64;
+                let vsize = if sh.virtual_size != 0 { sh.virtual_size as u64 } else { sh.size_of_raw_data as u64 };
+                let vend = vstart.saturating_add(vsize);
+                if rva >= vstart && rva < vend {
+                    target_sh = Some(*sh);
+                    break;
+                }
+            }
+            if target_sh.is_none() {
+                return Err(anyhow::anyhow!("指定した開始アドレスがセクションにもヘッダーにも属しません"));
+            }
+            start_rva_in_image = rva;
+        }
+    } else if disasm_base_text {
+        if let Some(h) = text_hdr {
+            target_sh = Some(h);
+            start_rva_in_image = h.virtual_address as u64;
+        } else {
+            return Err(anyhow::anyhow!("コードセクションが見つかりません"));
+        }
+    } else if let Some(h) = ep_hdr {
+        target_sh = Some(h);
+        start_rva_in_image = entry_point_rva as u64;
+    } else if entry_point_rva != 0 && (entry_point_rva as u64) < (size_of_headers as u64) {
+        in_headers = true;
+        start_rva_in_image = entry_point_rva as u64;
     } else if let Some(h) = text_hdr {
-        (h, h.virtual_address as u64)
+        target_sh = Some(h);
+        start_rva_in_image = h.virtual_address as u64;
     } else {
         return Err(anyhow::anyhow!("コードセクションが見つかりません"));
-    };
+    }
 
-    // .text の生データを読み出し
-    if target_sh.pointer_to_raw_data == 0 || target_sh.size_of_raw_data == 0 {
-        return Err(anyhow::anyhow!(".text のRawデータがありません"));
+    // 逆アセンブル対象の生データを読み出し（セクション or ヘッダー領域）
+    let file_start: u64;
+    let read_len: usize;
+    if in_headers {
+        let max_len = size_of_headers as u64;
+        if start_rva_in_image >= max_len {
+            return Err(anyhow::anyhow!("エントリポイントがヘッダーの範囲外です"));
+        }
+        file_start = start_rva_in_image;
+        read_len = (max_len - start_rva_in_image) as usize;
+    } else {
+        let target_sh = target_sh.ok_or_else(|| anyhow::anyhow!("コードセクションが見つかりません"))?;
+        if target_sh.pointer_to_raw_data == 0 || target_sh.size_of_raw_data == 0 {
+            return Err(anyhow::anyhow!(".text のRawデータがありません"));
+        }
+        // セクション内オフセットを計算してEP位置から読み出す
+        let start_offset_in_section = (start_rva_in_image as i64 - target_sh.virtual_address as i64).max(0) as u64;
+        let max_len = target_sh.size_of_raw_data as u64;
+        if start_offset_in_section >= max_len {
+            return Err(anyhow::anyhow!("エントリポイントがセクションの範囲外です"));
+        }
+        file_start = (target_sh.pointer_to_raw_data as u64).saturating_add(start_offset_in_section);
+        read_len = (max_len - start_offset_in_section) as usize;
     }
-    // セクション内オフセットを計算してEP位置から読み出す
-    let start_offset_in_section = (start_rva_in_image as i64 - target_sh.virtual_address as i64).max(0) as u64;
-    let file_start = (target_sh.pointer_to_raw_data as u64).saturating_add(start_offset_in_section);
-    let max_len = target_sh.size_of_raw_data as u64;
-    if start_offset_in_section >= max_len {
-        return Err(anyhow::anyhow!("エントリポイントがセクションの範囲外です"));
+
+    println!("\n[disasm] ImageBase=0x{:X} EntryPointRVA=0x{:X} SizeOfHeaders=0x{:X} use_va={} thumb={} in_headers={} file_start=0x{:X} read_len=0x{:X}",
+        image_base,
+        entry_point_rva,
+        size_of_headers,
+        use_va,
+        force_thumb,
+        in_headers,
+        file_start,
+        read_len
+    );
+    if let Some(sh) = target_sh {
+        let name_bytes = &sh.name;
+        let end = name_bytes.iter().position(|&x| x == 0).unwrap_or(8);
+        let name = std::str::from_utf8(&name_bytes[..end]).unwrap_or("");
+        println!("[disasm] section='{}' VA=0x{:X} VSZ=0x{:X} RawSize=0x{:X} RawPtr=0x{:X}",
+            name,
+            sh.virtual_address,
+            sh.virtual_size,
+            sh.size_of_raw_data,
+            sh.pointer_to_raw_data
+        );
     }
-    let read_len = (max_len - start_offset_in_section) as usize;
     file.seek(SeekFrom::Start(file_start))?;
     let mut code: Vec<u8> = vec![0u8; read_len];
     file.read_exact(&mut code)?;
 
     // Capstone 準備（x86/x64/ARM/ARM64対応）
+    let mut is_thumb_mode = false;
     let cs = match (pe.machine, is_pe32_plus) {
         (0x014c, false) => {
             // x86 32bit (LE固定)
@@ -437,6 +523,7 @@ fn disassemble_text(
         (0x01C4, false) | (0x01C2, false) | (0x01C0, false) => {
             // ARM/Thumb/ARMNT
             let mode = if force_thumb { ArmMode::Thumb } else { ArmMode::Arm };
+            is_thumb_mode = force_thumb;
             Capstone::new().arm().mode(mode).endian(Endian::Little).build()?
         }
         (0xAA64, true) => {
@@ -468,6 +555,9 @@ fn disassemble_text(
                                     let rva = base + off;
                                     let key = if use_va { image_base + rva } else { rva };
                                     labels.entry(key).or_insert_with(|| p.name.to_string().into());
+                                    if is_thumb_mode {
+                                        labels.entry(key | 1).or_insert_with(|| p.name.to_string().into());
+                                    }
                                 }
                             }
                             Ok(SymbolData::Procedure(proc)) => {
@@ -478,6 +568,9 @@ fn disassemble_text(
                                     let rva = base + off;
                                     let key = if use_va { image_base + rva } else { rva };
                                     labels.entry(key).or_insert_with(|| proc.name.to_string().into());
+                                    if is_thumb_mode {
+                                        labels.entry(key | 1).or_insert_with(|| proc.name.to_string().into());
+                                    }
                                 }
                             }
                             _ => {}
@@ -488,9 +581,48 @@ fn disassemble_text(
         }
     }
 
-    println!("\n=== 逆アセンブル (EntryPoint起点) ===");
-    let start_addr = if use_va { image_base + start_rva_in_image } else { start_rva_in_image };
-    let insns = if let Some(n) = limit { cs.disasm_count(&code, start_addr, n)? } else { cs.disasm_all(&code, start_addr)? };
+    if disasm_start.is_some() {
+        println!("\n=== 逆アセンブル (指定アドレス起点) ===");
+    } else if disasm_base_text {
+        println!("\n=== 逆アセンブル (.text起点) ===");
+    } else {
+        println!("\n=== 逆アセンブル (EntryPoint起点) ===");
+    }
+    let mut start_addr = if use_va { image_base + start_rva_in_image } else { start_rva_in_image };
+    if is_thumb_mode {
+        start_addr |= 1;
+    }
+
+    // x86/x64: エントリポイントがjmpスタブの場合、ジャンプ先へ追従（範囲内のみ）
+    let mut code_start_offset: usize = 0;
+    if (pe.machine == 0x014c || pe.machine == 0x8664) && !in_headers {
+        if let Ok(first) = cs.disasm_count(&code, start_addr, 1) {
+            if let Some(i0) = first.iter().next() {
+                if i0.mnemonic() == Some("jmp") {
+                    if let Some(op) = i0.op_str() {
+                        if let Some(jmp_target_addr) = parse_hex_u64(op) {
+                            // Capstoneが返すオペランドは、ここではVA/RVA表示モードに従ったアドレス値のはず
+                            let jmp_target_rva = if use_va {
+                                jmp_target_addr.saturating_sub(image_base)
+                            } else {
+                                jmp_target_addr
+                            };
+                            if jmp_target_rva >= start_rva_in_image {
+                                let delta = (jmp_target_rva - start_rva_in_image) as usize;
+                                if delta < code.len() {
+                                    code_start_offset = delta;
+                                    start_addr = if use_va { image_base + jmp_target_rva } else { jmp_target_rva };
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let code_view = &code[code_start_offset..];
+    let insns = if let Some(n) = limit { cs.disasm_count(code_view, start_addr, n)? } else { cs.disasm_all(code_view, start_addr)? };
     for i in insns.iter() {
         if let Some(name) = labels.get(&i.address()) {
             println!("\n{}:", name);
@@ -1139,6 +1271,20 @@ fn main() -> Result<()> {
                 .required(false),
         )
         .arg(
+            Arg::new("disasm-start")
+                .long("disasm-start")
+                .value_name("HEX")
+                .help("逆アセンブル開始アドレス（--addr に従い va または rva として解釈）")
+                .required(false),
+        )
+        .arg(
+            Arg::new("disasm-base")
+                .long("disasm-base")
+                .value_name("MODE")
+                .help("逆アセンブル起点: ep または text (既定: ep)")
+                .required(false),
+        )
+        .arg(
             Arg::new("pdb-symbols")
                 .long("pdb-symbols")
                 .help("PDBのPublic/Procedureシンボルをアドレス順に列挙して表示")
@@ -1200,7 +1346,16 @@ fn main() -> Result<()> {
         let addr_mode = matches.get_one::<String>("addr").map(|s| s.to_ascii_lowercase()).unwrap_or_else(|| "va".to_string());
         let use_va = addr_mode != "rva";
         let force_thumb = matches.get_flag("thumb");
-        if let Err(e) = disassemble_text(file_path, pdb_opt, limit, use_va, force_thumb) {
+        let disasm_base = matches.get_one::<String>("disasm-base").map(|s| s.to_ascii_lowercase()).unwrap_or_else(|| "ep".to_string());
+        let disasm_base_text = disasm_base == "text";
+        let disasm_start = matches
+            .get_one::<String>("disasm-start")
+            .and_then(|s| {
+                let s = s.trim();
+                let s = s.strip_prefix("0x").unwrap_or(s);
+                u64::from_str_radix(s, 16).ok()
+            });
+        if let Err(e) = disassemble_text(file_path, pdb_opt, limit, use_va, force_thumb, disasm_start, disasm_base_text) {
             eprintln!("逆アセンブルでエラー: {:#}", e);
         }
     }
