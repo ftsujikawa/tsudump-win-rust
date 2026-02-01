@@ -528,7 +528,7 @@ fn disassemble_text(
         }
         (0xAA64, true) => {
             // ARM64
-            Capstone::new().arm64().build()?
+            Capstone::new().arm64().mode(capstone::arch::arm64::ArchMode::Arm).endian(Endian::Little).build()?
         }
         (m, _) => {
             println!("現状未対応のMachine: 0x{:04X}。x86/x64/ARM/ARM64に対応しています。", m);
