@@ -1,4 +1,4 @@
-int i = 0;#include <stdio.h>
+#include <stdio.h>
 
 void func() {
     printf("func\n");
