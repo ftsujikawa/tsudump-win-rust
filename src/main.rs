@@ -342,10 +342,172 @@ fn disassemble_text(
     disasm_start: Option<u64>,
     disasm_base_text: bool,
 ) -> Result<()> {
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct DataDirectory {
+        virtual_address: u32,
+        size: u32,
+    }
+
+    fn rva_to_file_offset_and_max_read(rva: u64, sections: &[SectionHeader]) -> Option<(u64, u64)> {
+        for sh in sections {
+            let vstart = sh.virtual_address as u64;
+            let vsize = if sh.virtual_size != 0 { sh.virtual_size as u64 } else { sh.size_of_raw_data as u64 };
+            let vend = vstart.saturating_add(vsize);
+            if rva >= vstart && rva < vend {
+                let delta = rva - vstart;
+                let raw_size = sh.size_of_raw_data as u64;
+                if delta < raw_size {
+                    let off = (sh.pointer_to_raw_data as u64).saturating_add(delta);
+                    let max_read = raw_size - delta;
+                    return Some((off, max_read));
+                }
+                return None;
+            }
+        }
+        None
+    }
+
+    fn va_to_file_offset_and_max_read(va: u64, image_base: u64, use_va: bool, sections: &[SectionHeader]) -> Option<(u64, u64)> {
+        let rva = if use_va { va.checked_sub(image_base)? } else { va };
+        rva_to_file_offset_and_max_read(rva, sections)
+    }
+
+    fn find_section_by_name<'a>(sections: &'a [SectionHeader], name: &str) -> Option<&'a SectionHeader> {
+        for sh in sections {
+            let raw = &sh.name;
+            let nul = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+            if let Ok(s) = std::str::from_utf8(&raw[..nul]) {
+                if s == name {
+                    return Some(sh);
+                }
+            }
+        }
+        None
+    }
+
+    fn read_u64_at_va(file: &File, va: u64, image_base: u64, use_va: bool, sections: &[SectionHeader]) -> Option<u64> {
+        let (off, max_read) = va_to_file_offset_and_max_read(va, image_base, use_va, sections)?;
+        if max_read < 8 {
+            return None;
+        }
+        let mut f = file.try_clone().ok()?;
+        let saved = f.stream_position().ok()?;
+        if f.seek(SeekFrom::Start(off)).is_err() {
+            return None;
+        }
+        let mut buf = [0u8; 8];
+        if f.read_exact(&mut buf).is_err() {
+            let _ = f.seek(SeekFrom::Start(saved));
+            return None;
+        }
+        let _ = f.seek(SeekFrom::Start(saved));
+        Some(u64::from_le_bytes(buf))
+    }
+
+    fn parse_rip_disp_u64(op: &str) -> Option<i64> {
+        let s = op;
+        let rip_pos = s.find("rip")?;
+        let rest = &s[rip_pos + 3..];
+        let plus = rest.find('+');
+        let minus = rest.find('-');
+        let (sign, idx) = match (plus, minus) {
+            (Some(p), Some(m)) => if p < m { (1i64, p) } else { (-1i64, m) },
+            (Some(p), None) => (1i64, p),
+            (None, Some(m)) => (-1i64, m),
+            (None, None) => return None,
+        };
+        let after = rest[idx + 1..].trim_start();
+
+        // 0x... または 16進数列を抽出
+        let bytes = after.as_bytes();
+        let mut i = 0usize;
+        while i < bytes.len() && (bytes[i] as char).is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            return None;
+        }
+        if i + 2 <= bytes.len() && bytes[i] == b'0' && (bytes[i + 1] == b'x' || bytes[i + 1] == b'X') {
+            i += 2;
+        }
+        let mut digits = String::new();
+        while i < bytes.len() {
+            let c = bytes[i] as char;
+            if c.is_ascii_hexdigit() {
+                digits.push(c);
+                i += 1;
+                continue;
+            }
+            if c.is_ascii_whitespace() {
+                i += 1;
+                continue;
+            }
+            break;
+        }
+        if digits.is_empty() {
+            return None;
+        }
+        let v = i64::from_str_radix(&digits, 16).ok()?;
+        Some(sign * v)
+    }
+
     fn parse_hex_u64(s: &str) -> Option<u64> {
         let s = s.trim();
         let s = s.strip_prefix("0x").unwrap_or(s);
         u64::from_str_radix(s, 16).ok()
+    }
+
+    fn read_cstring_at_file_offset(file: &File, off: u64) -> Option<String> {
+        let mut f = file.try_clone().ok()?;
+        let saved = f.stream_position().ok()?;
+        if f.seek(SeekFrom::Start(off)).is_err() {
+            return None;
+        }
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 1];
+        while bytes.len() < 4096 {
+            if f.read_exact(&mut buf).is_err() {
+                let _ = f.seek(SeekFrom::Start(saved));
+                return None;
+            }
+            if buf[0] == 0 {
+                break;
+            }
+            bytes.push(buf[0]);
+        }
+        let _ = f.seek(SeekFrom::Start(saved));
+        String::from_utf8(bytes).ok()
+    }
+
+    fn read_u32_at_file_offset(file: &File, off: u64) -> Option<u32> {
+        let mut f = file.try_clone().ok()?;
+        let saved = f.stream_position().ok()?;
+        if f.seek(SeekFrom::Start(off)).is_err() {
+            return None;
+        }
+        let mut buf = [0u8; 4];
+        if f.read_exact(&mut buf).is_err() {
+            let _ = f.seek(SeekFrom::Start(saved));
+            return None;
+        }
+        let _ = f.seek(SeekFrom::Start(saved));
+        Some(u32::from_le_bytes(buf))
+    }
+
+    fn read_u64_at_file_offset(file: &File, off: u64) -> Option<u64> {
+        let mut f = file.try_clone().ok()?;
+        let saved = f.stream_position().ok()?;
+        if f.seek(SeekFrom::Start(off)).is_err() {
+            return None;
+        }
+        let mut buf = [0u8; 8];
+        if f.read_exact(&mut buf).is_err() {
+            let _ = f.seek(SeekFrom::Start(saved));
+            return None;
+        }
+        let _ = f.seek(SeekFrom::Start(saved));
+        Some(u64::from_le_bytes(buf))
     }
 
     let mut file = File::open(file_path)
@@ -366,23 +528,40 @@ fn disassemble_text(
     let image_base: u64;
     let entry_point_rva: u32;
     let size_of_headers: u32;
+    let exception_dir: Option<DataDirectory>;
+    let import_dir: Option<DataDirectory>;
     if magic == 0x010b {
         let opt: OptionalHeader32 = read_struct(&mut file)?;
         image_base = opt.image_base as u64;
         entry_point_rva = opt.address_of_entry_point;
         size_of_headers = opt.size_of_headers;
-        // 残り（データディレクトリ）スキップ
-        let read_size = std::mem::size_of::<OptionalHeader32>() as i64;
+        // DataDirectoryを読む
+        let dd_count = opt.number_of_rva_and_sizes.min(16);
+        let mut dds: Vec<DataDirectory> = Vec::with_capacity(dd_count as usize);
+        for _ in 0..dd_count {
+            dds.push(read_struct::<DataDirectory>(&mut file)?);
+        }
+        // 残りスキップ
+        let read_size = std::mem::size_of::<OptionalHeader32>() as i64 + (dd_count as i64) * (std::mem::size_of::<DataDirectory>() as i64);
         let remaining = (pe.size_of_optional_header as i64) - read_size;
         if remaining > 0 { file.seek(SeekFrom::Current(remaining))?; }
+        exception_dir = dds.get(3).copied();
+        import_dir = dds.get(1).copied();
     } else if magic == 0x020b {
         let opt: OptionalHeader64 = read_struct(&mut file)?;
         image_base = opt.image_base as u64;
         entry_point_rva = opt.address_of_entry_point;
         size_of_headers = opt.size_of_headers;
-        let read_size = std::mem::size_of::<OptionalHeader64>() as i64;
+        let dd_count = opt.number_of_rva_and_sizes.min(16);
+        let mut dds: Vec<DataDirectory> = Vec::with_capacity(dd_count as usize);
+        for _ in 0..dd_count {
+            dds.push(read_struct::<DataDirectory>(&mut file)?);
+        }
+        let read_size = std::mem::size_of::<OptionalHeader64>() as i64 + (dd_count as i64) * (std::mem::size_of::<DataDirectory>() as i64);
         let remaining = (pe.size_of_optional_header as i64) - read_size;
         if remaining > 0 { file.seek(SeekFrom::Current(remaining))?; }
+        exception_dir = dds.get(3).copied();
+        import_dir = dds.get(1).copied();
     } else {
         return Err(anyhow::anyhow!(format!("未知のOptionalHeader Magic: 0x{:04X}", magic)));
     }
@@ -581,6 +760,145 @@ fn disassemble_text(
         }
     }
 
+    // Import Directory から IAT(VA) -> "dll!func" を構築（間接callの解決用）
+    let mut iat_names: BTreeMap<u64, String> = BTreeMap::new();
+    if is_pe32_plus {
+        if let Some(dd) = import_dir {
+            if dd.virtual_address != 0 {
+                let imp_rva = dd.virtual_address as u64;
+                if let Some((imp_off, _max_read)) = rva_to_file_offset_and_max_read(imp_rva, &section_list) {
+                    // IMAGE_IMPORT_DESCRIPTOR (20 bytes)
+                    let mut idx = 0u64;
+                    loop {
+                        let base = imp_off.saturating_add(idx.saturating_mul(20));
+                        let original_first_thunk = match read_u32_at_file_offset(&file, base) {
+                            Some(v) => v as u64,
+                            None => break,
+                        };
+                        let name_rva = match read_u32_at_file_offset(&file, base + 12) {
+                            Some(v) => v as u64,
+                            None => break,
+                        };
+                        let first_thunk = match read_u32_at_file_offset(&file, base + 16) {
+                            Some(v) => v as u64,
+                            None => break,
+                        };
+                        if original_first_thunk == 0 && name_rva == 0 && first_thunk == 0 {
+                            break;
+                        }
+
+                        let dll_name = if name_rva != 0 {
+                            rva_to_file_offset_and_max_read(name_rva, &section_list)
+                                .and_then(|(o, _)| read_cstring_at_file_offset(&file, o))
+                                .unwrap_or_else(|| String::from("<dll>"))
+                        } else {
+                            String::from("<dll>")
+                        };
+
+                        let ilt_rva = if original_first_thunk != 0 { original_first_thunk } else { first_thunk };
+                        let mut t = 0u64;
+                        loop {
+                            let thunk_rva = ilt_rva.saturating_add(t.saturating_mul(8));
+                            let iat_rva = first_thunk.saturating_add(t.saturating_mul(8));
+                            let thunk_off = match rva_to_file_offset_and_max_read(thunk_rva, &section_list) {
+                                Some((o, mr)) if mr >= 8 => o,
+                                _ => break,
+                            };
+
+                            let val = match read_u64_at_file_offset(&file, thunk_off) {
+                                Some(v) => v,
+                                None => break,
+                            };
+                            if val == 0 { break; }
+
+                            // IMAGE_ORDINAL_FLAG64
+                            if (val & 0x8000_0000_0000_0000) == 0 {
+                                let ibn_rva = val as u64;
+                                if let Some((ibn_off, mr)) = rva_to_file_offset_and_max_read(ibn_rva, &section_list) {
+                                    if mr >= 3 {
+                                        // hint(u16) + name
+                                        if let Some(func) = read_cstring_at_file_offset(&file, ibn_off + 2) {
+                                            let iat_va = if use_va { image_base + iat_rva } else { iat_rva };
+                                            iat_names.insert(iat_va, format!("{}!{}", dll_name, func));
+                                        }
+                                    }
+                                }
+                            }
+
+                            t += 1;
+                        }
+
+                        idx += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // .pdata から RUNTIME_FUNCTION 範囲を構築（x64向け）
+    let mut runtime_funcs: Vec<(u64, u64)> = Vec::new();
+    if is_pe32_plus {
+        // まずはException Directoryから（存在すれば）
+        if let Some(dd) = exception_dir {
+            if dd.virtual_address != 0 && dd.size >= 12 {
+                let pdata_rva = dd.virtual_address as u64;
+                let pdata_size = dd.size as u64;
+                if let Some((pdata_off, max_read)) = rva_to_file_offset_and_max_read(pdata_rva, &section_list) {
+                    let read_len = pdata_size.min(max_read);
+                    if read_len >= 12 && read_len <= (usize::MAX as u64) {
+                        let saved = file.stream_position()?;
+                        file.seek(SeekFrom::Start(pdata_off))?;
+                        let mut buf = vec![0u8; read_len as usize];
+                        if file.read_exact(&mut buf).is_ok() {
+                            let mut i = 0usize;
+                            while i + 12 <= buf.len() {
+                                let begin = u32::from_le_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]) as u64;
+                                let end = u32::from_le_bytes([buf[i + 4], buf[i + 5], buf[i + 6], buf[i + 7]]) as u64;
+                                if begin != 0 && end > begin {
+                                    let b = if use_va { image_base + begin } else { begin };
+                                    let e = if use_va { image_base + end } else { end };
+                                    runtime_funcs.push((b, e));
+                                }
+                                i += 12;
+                            }
+                        }
+                        file.seek(SeekFrom::Start(saved))?;
+                    }
+                }
+            }
+        }
+
+        // フォールバック: .pdata セクションの生データ全体も読む（Exception Directoryが不完全な場合の救済）
+        if let Some(pdata_sec) = find_section_by_name(&section_list, ".pdata") {
+            if pdata_sec.size_of_raw_data as u64 >= 12 {
+                let pdata_off = pdata_sec.pointer_to_raw_data as u64;
+                let read_len = pdata_sec.size_of_raw_data as u64;
+                if read_len <= (usize::MAX as u64) {
+                    let saved = file.stream_position()?;
+                    file.seek(SeekFrom::Start(pdata_off))?;
+                    let mut buf = vec![0u8; read_len as usize];
+                    if file.read_exact(&mut buf).is_ok() {
+                        let mut i = 0usize;
+                        while i + 12 <= buf.len() {
+                            let begin = u32::from_le_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]) as u64;
+                            let end = u32::from_le_bytes([buf[i + 4], buf[i + 5], buf[i + 6], buf[i + 7]]) as u64;
+                            if begin != 0 && end > begin {
+                                let b = if use_va { image_base + begin } else { begin };
+                                let e = if use_va { image_base + end } else { end };
+                                runtime_funcs.push((b, e));
+                            }
+                            i += 12;
+                        }
+                    }
+                    file.seek(SeekFrom::Start(saved))?;
+                }
+            }
+        }
+
+        runtime_funcs.sort_by_key(|e| e.0);
+        runtime_funcs.dedup();
+    }
+
     if disasm_start.is_some() {
         println!("\n=== 逆アセンブル (指定アドレス起点) ===");
     } else if disasm_base_text {
@@ -624,17 +942,204 @@ fn disassemble_text(
     let code_view = &code[code_start_offset..];
     let insns = if let Some(n) = limit { cs.disasm_count(code_view, start_addr, n)? } else { cs.disasm_all(code_view, start_addr)? };
     for i in insns.iter() {
-        if let Some(name) = labels.get(&i.address()) {
-            println!("\n{}:", name);
-        }
-        let op = i.op_str().unwrap_or("");
-        if use_va {
-            if is_pe32_plus { println!("0x{:016X}: {:7} {}", i.address(), i.mnemonic().unwrap_or(""), op); }
-            else { println!("0x{:08X}:  {:7} {}", i.address() as u32, i.mnemonic().unwrap_or(""), op); }
+        let mut op = i.op_str().unwrap_or("").to_string();
+        let addr = i.address();
+        let sym = labels.range(..=addr).next_back();
+        let addr_str = if use_va {
+            if is_pe32_plus {
+                if let Some((sym_addr, name)) = sym {
+                    let off = addr.saturating_sub(*sym_addr);
+                    if off == 0 { format!("0x{:016X} <{}>", addr, name) }
+                    else { format!("0x{:016X} <{}+0x{:X}>", addr, name, off) }
+                } else {
+                    format!("0x{:016X}", addr)
+                }
+            } else {
+                if let Some((sym_addr, name)) = sym {
+                    let off = addr.saturating_sub(*sym_addr);
+                    if off == 0 { format!("0x{:08X} <{}>", addr as u32, name) }
+                    else { format!("0x{:08X} <{}+0x{:X}>", addr as u32, name, off) }
+                } else {
+                    format!("0x{:08X}", addr as u32)
+                }
+            }
         } else {
             // RVAは32bit幅で表示
-            println!("0x{:08X}:  {:7} {}", i.address() as u32, i.mnemonic().unwrap_or(""), op);
+            if let Some((sym_addr, name)) = sym {
+                let off = addr.saturating_sub(*sym_addr);
+                if off == 0 { format!("0x{:08X} <{}>", addr as u32, name) }
+                else { format!("0x{:08X} <{}+0x{:X}>", addr as u32, name, off) }
+            } else {
+                format!("0x{:08X}", addr as u32)
+            }
+        };
+
+        fn parse_first_hex_u64(s: &str) -> Option<u64> {
+            let bytes = s.as_bytes();
+            let mut i = 0usize;
+            while i + 2 <= bytes.len() {
+                if bytes[i] == b'0' && (bytes[i + 1] == b'x' || bytes[i + 1] == b'X') {
+                    let mut j = i + 2;
+                    let mut digits = String::new();
+                    while j < bytes.len() {
+                        let c = bytes[j] as char;
+                        if c.is_ascii_whitespace() {
+                            j += 1;
+                            continue;
+                        }
+                        if c.is_ascii_hexdigit() {
+                            digits.push(c);
+                            j += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                    if !digits.is_empty() {
+                        if let Ok(v) = u64::from_str_radix(&digits, 16) {
+                            return Some(v);
+                        }
+                    }
+                }
+                i += 1;
+            }
+
+            // 0x... が無い場合の救済: 十分長い16進数列(例: 1400010c0)を拾う
+            let mut best: Option<String> = None;
+            let mut run = String::new();
+            for c in s.chars() {
+                if c.is_ascii_hexdigit() {
+                    run.push(c);
+                } else {
+                    if run.len() >= 8 {
+                        best = Some(run.clone());
+                        break;
+                    }
+                    run.clear();
+                }
+            }
+            if best.is_none() && run.len() >= 8 {
+                best = Some(run);
+            }
+            if let Some(d) = best {
+                return u64::from_str_radix(&d, 16).ok();
+            }
+
+            None
         }
+
+        fn find_containing_range(ranges: &[(u64, u64)], addr: u64) -> Option<(u64, u64)> {
+            let mut lo = 0usize;
+            let mut hi = ranges.len();
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                if ranges[mid].0 <= addr { lo = mid + 1; } else { hi = mid; }
+            }
+            if lo == 0 { return None; }
+            let (start, end) = ranges[lo - 1];
+            if addr >= start && addr < end { Some((start, end)) } else { None }
+        }
+
+        fn resolve_func_label_in_range(
+            labels: &BTreeMap<u64, String>,
+            range_start: u64,
+            range_end: u64,
+            target: u64,
+        ) -> Option<(u64, &str)> {
+            if target < range_start {
+                return None;
+            }
+
+            // まずは「範囲内で target 以下の直前ラベル」を採用（関数先頭のPublic/Procedureがあるケースが多い）
+            if let Some((addr, name)) = labels.range(range_start..=target).next_back() {
+                if *addr < range_end {
+                    return Some((*addr, name.as_str()));
+                }
+            }
+
+            // それも無ければ、範囲内の先頭ラベル
+            labels
+                .range(range_start..range_end)
+                .next()
+                .map(|(addr, name)| (*addr, name.as_str()))
+        }
+
+        fn is_jcc(m: &str) -> bool {
+            matches!(
+                m,
+                "je" | "jne" | "jz" | "jnz" | "ja" | "jae" | "jb" | "jbe" | "jg" | "jge" | "jl" | "jle" | "js" | "jns" | "jo" | "jno" | "jp" | "jnp" | "jc" | "jnc" | "jcxz" | "jecxz" | "jrcxz"
+            )
+        }
+
+        let mnem = i.mnemonic().unwrap_or("");
+        if mnem == "call" || mnem == "jmp" || is_jcc(mnem) {
+            // call/jmp/jcc qword ptr [rip + 0x....] のような間接分岐は、0x... がdisplacementであり
+            // 分岐先アドレスではないため、即値パースを行わない。
+            let mut resolved_target: Option<u64> = if op.contains("[rip") {
+                None
+            } else {
+                parse_first_hex_u64(&op)
+            };
+            let mut indirect_mem_va: Option<u64> = None;
+            if resolved_target.is_none() {
+                // call/jmp/jcc qword ptr [rip +/- disp] の場合、IAT等のポインタを読んで解決
+                if op.contains("[rip") {
+                    if let Some(disp) = parse_rip_disp_u64(&op) {
+                        let insn_size = i.bytes().len() as u64;
+                        if insn_size != 0 {
+                            let rip = i.address().wrapping_add(insn_size);
+                            let mem_va = if disp >= 0 {
+                                rip.wrapping_add(disp as u64)
+                            } else {
+                                rip.wrapping_sub((-disp) as u64)
+                            };
+                            indirect_mem_va = Some(mem_va);
+                            if let Some(ptr) = read_u64_at_va(&file, mem_va, image_base, use_va, &section_list) {
+                                // ptr が実関数アドレスとして .pdata 範囲に入る場合だけ採用。
+                                // ファイル上のIATは IMAGE_IMPORT_BY_NAME へのRVA などになりがちで、
+                                // それをターゲット扱いすると誤判定で表示が出なくなる。
+                                if ptr != 0 {
+                                    if find_containing_range(&runtime_funcs, ptr).is_some() {
+                                        resolved_target = Some(ptr);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(target_addr) = resolved_target {
+                if let Some((rstart, _rend)) = find_containing_range(&runtime_funcs, target_addr) {
+                    if let Some((sym_addr, name)) = resolve_func_label_in_range(&labels, rstart, _rend, target_addr) {
+                        let off = target_addr.saturating_sub(sym_addr);
+                        if off == 0 { op = format!("{} <{}>", op, name); }
+                        else { op = format!("{} <{}+0x{:X}>", op, name, off); }
+                    } else {
+                        op = format!("{} <0x{:X}>", op, target_addr);
+                    }
+                } else if let Some(name) = labels.get(&target_addr) {
+                    op = format!("{} <{}>", op, name);
+                } else if let Some((sym_addr, name)) = labels.range(..=target_addr).next_back() {
+                    let off = target_addr.saturating_sub(*sym_addr);
+                    if off == 0 { op = format!("{} <{}>", op, name); }
+                    else { op = format!("{} <{}+0x{:X}>", op, name, off); }
+                } else {
+                    op = format!("{} <0x{:X}>", op, target_addr);
+                }
+            } else if let Some(mem_va) = indirect_mem_va {
+                // IAT等: ファイル上ではポインタ値が0で解決できないことがある。
+                // その場合でも __imp_... のようなラベルがあれば表示する。
+                if let Some(name) = labels.get(&mem_va) {
+                    op = format!("{} <{}>", op, name);
+                } else if let Some(name) = iat_names.get(&mem_va) {
+                    op = format!("{} <{}>", op, name);
+                } else {
+                    op = format!("{} <0x{:X}>", op, mem_va);
+                }
+            }
+        }
+
+        println!("{}:  {:7} {}", addr_str, i.mnemonic().unwrap_or(""), op);
     }
 
     Ok(())
@@ -1291,6 +1796,12 @@ fn main() -> Result<()> {
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
+            Arg::new("pdb-info")
+                .long("pdb-info")
+                .help("PDBの概要情報を表示（--pdb指定時のみ有効）")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
             Arg::new("pdb-lines")
                 .long("pdb-lines")
                 .help("PDBの行番号情報を列挙して表示")
@@ -1305,11 +1816,15 @@ fn main() -> Result<()> {
     
     display_pe_header(file_path)?;
 
-    // 任意のPDB解析
-    if let Some(pdb_path) = matches.get_one::<String>("pdb") {
-        let pdb_path: &str = pdb_path;
-        if let Err(e) = display_pdb_info(pdb_path) {
-            eprintln!("PDB解析でエラー: {:#}", e);
+    // PDB概要表示（明示オプション時のみ）
+    if matches.get_flag("pdb-info") {
+        if let Some(pdb_path) = matches.get_one::<String>("pdb") {
+            let pdb_path: &str = pdb_path;
+            if let Err(e) = display_pdb_info(pdb_path) {
+                eprintln!("PDB解析でエラー: {:#}", e);
+            }
+        } else {
+            eprintln!("--pdb-info を使うには --pdb <PDB> の指定が必要です。");
         }
     }
 
