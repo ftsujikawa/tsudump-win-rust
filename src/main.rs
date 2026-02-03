@@ -568,7 +568,6 @@ fn disassemble_text(
 
     // セクションヘッダーを収集しつつ、.text候補とEPを含むセクションを探す
     let mut text_hdr: Option<SectionHeader> = None;
-    let mut ep_hdr: Option<SectionHeader> = None;
     let mut section_rvas: Vec<u32> = Vec::with_capacity(pe.number_of_sections as usize);
     let mut section_list: Vec<SectionHeader> = Vec::with_capacity(pe.number_of_sections as usize);
     for _ in 0..pe.number_of_sections {
@@ -585,108 +584,28 @@ fn disassemble_text(
         let vstart = sh.virtual_address;
         let vsize = if sh.virtual_size != 0 { sh.virtual_size } else { sh.size_of_raw_data };
         let vend = vstart.saturating_add(vsize);
-        if entry_point_rva >= vstart && entry_point_rva < vend {
-            ep_hdr = Some(sh);
-        }
+        let _ = (entry_point_rva, vstart, vend);
     }
 
-    // 逆アセンブル対象と開始RVAを決定
+    // 逆アセンブル開始RVAを決定
     // - disasm_start があればそれを最優先
     // - それ以外は disasm_base_text=true なら .text 先頭
-    // - それ以外は EP 優先（EPがヘッダー領域ならヘッダー。なければ.text先頭）
-    let mut target_sh: Option<SectionHeader> = None;
-    let start_rva_in_image: u64;
-    let mut in_headers = false;
-    if let Some(a) = disasm_start {
-        let rva = if use_va { a.saturating_sub(image_base) } else { a };
-        if rva < (size_of_headers as u64) {
-            in_headers = true;
-            start_rva_in_image = rva;
-        } else {
-            for sh in &section_list {
-                let vstart = sh.virtual_address as u64;
-                let vsize = if sh.virtual_size != 0 { sh.virtual_size as u64 } else { sh.size_of_raw_data as u64 };
-                let vend = vstart.saturating_add(vsize);
-                if rva >= vstart && rva < vend {
-                    target_sh = Some(*sh);
-                    break;
-                }
-            }
-            if target_sh.is_none() {
-                return Err(anyhow::anyhow!("指定した開始アドレスがセクションにもヘッダーにも属しません"));
-            }
-            start_rva_in_image = rva;
-        }
+    // - それ以外は EP 優先
+    let start_rva_in_image: u64 = if let Some(a) = disasm_start {
+        if use_va { a.saturating_sub(image_base) } else { a }
     } else if disasm_base_text {
-        if let Some(h) = text_hdr {
-            target_sh = Some(h);
-            start_rva_in_image = h.virtual_address as u64;
-        } else {
-            return Err(anyhow::anyhow!("コードセクションが見つかりません"));
-        }
-    } else if let Some(h) = ep_hdr {
-        target_sh = Some(h);
-        start_rva_in_image = entry_point_rva as u64;
-    } else if entry_point_rva != 0 && (entry_point_rva as u64) < (size_of_headers as u64) {
-        in_headers = true;
-        start_rva_in_image = entry_point_rva as u64;
-    } else if let Some(h) = text_hdr {
-        target_sh = Some(h);
-        start_rva_in_image = h.virtual_address as u64;
+        if let Some(h) = text_hdr { h.virtual_address as u64 } else { return Err(anyhow::anyhow!("コードセクションが見つかりません")); }
     } else {
-        return Err(anyhow::anyhow!("コードセクションが見つかりません"));
-    }
+        entry_point_rva as u64
+    };
 
-    // 逆アセンブル対象の生データを読み出し（セクション or ヘッダー領域）
-    let file_start: u64;
-    let read_len: usize;
-    if in_headers {
-        let max_len = size_of_headers as u64;
-        if start_rva_in_image >= max_len {
-            return Err(anyhow::anyhow!("エントリポイントがヘッダーの範囲外です"));
-        }
-        file_start = start_rva_in_image;
-        read_len = (max_len - start_rva_in_image) as usize;
-    } else {
-        let target_sh = target_sh.ok_or_else(|| anyhow::anyhow!("コードセクションが見つかりません"))?;
-        if target_sh.pointer_to_raw_data == 0 || target_sh.size_of_raw_data == 0 {
-            return Err(anyhow::anyhow!(".text のRawデータがありません"));
-        }
-        // セクション内オフセットを計算してEP位置から読み出す
-        let start_offset_in_section = (start_rva_in_image as i64 - target_sh.virtual_address as i64).max(0) as u64;
-        let max_len = target_sh.size_of_raw_data as u64;
-        if start_offset_in_section >= max_len {
-            return Err(anyhow::anyhow!("エントリポイントがセクションの範囲外です"));
-        }
-        file_start = (target_sh.pointer_to_raw_data as u64).saturating_add(start_offset_in_section);
-        read_len = (max_len - start_offset_in_section) as usize;
-    }
-
-    println!("\n[disasm] ImageBase=0x{:X} EntryPointRVA=0x{:X} SizeOfHeaders=0x{:X} use_va={} thumb={} in_headers={} file_start=0x{:X} read_len=0x{:X}",
+    println!("\n[disasm] ImageBase=0x{:X} EntryPointRVA=0x{:X} SizeOfHeaders=0x{:X} use_va={} thumb={}",
         image_base,
         entry_point_rva,
         size_of_headers,
         use_va,
-        force_thumb,
-        in_headers,
-        file_start,
-        read_len
+        force_thumb
     );
-    if let Some(sh) = target_sh {
-        let name_bytes = &sh.name;
-        let end = name_bytes.iter().position(|&x| x == 0).unwrap_or(8);
-        let name = std::str::from_utf8(&name_bytes[..end]).unwrap_or("");
-        println!("[disasm] section='{}' VA=0x{:X} VSZ=0x{:X} RawSize=0x{:X} RawPtr=0x{:X}",
-            name,
-            sh.virtual_address,
-            sh.virtual_size,
-            sh.size_of_raw_data,
-            sh.pointer_to_raw_data
-        );
-    }
-    file.seek(SeekFrom::Start(file_start))?;
-    let mut code: Vec<u8> = vec![0u8; read_len];
-    file.read_exact(&mut code)?;
 
     // Capstone 準備（x86/x64/ARM/ARM64対応）
     let mut is_thumb_mode = false;
@@ -906,200 +825,77 @@ fn disassemble_text(
     } else {
         println!("\n=== 逆アセンブル (EntryPoint起点) ===");
     }
-    let mut start_addr = if use_va { image_base + start_rva_in_image } else { start_rva_in_image };
-    if is_thumb_mode {
-        start_addr |= 1;
+    // 逆アセンブル対象領域（実行可能/コードセクションのみ）を列挙
+    let mut regions: Vec<(String, u64, u64, u64)> = Vec::new();
+    for sh in &section_list {
+        if sh.pointer_to_raw_data == 0 || sh.size_of_raw_data == 0 {
+            continue;
+        }
+        let name_bytes = &sh.name;
+        let end = name_bytes.iter().position(|&x| x == 0).unwrap_or(8);
+        let name = std::str::from_utf8(&name_bytes[..end]).unwrap_or("").to_string();
+        let is_code = (sh.characteristics & 0x00000020) != 0; // IMAGE_SCN_CNT_CODE
+        let is_exec = (sh.characteristics & 0x20000000) != 0; // IMAGE_SCN_MEM_EXECUTE
+        if !is_code && !is_exec {
+            continue;
+        }
+        regions.push((name, sh.virtual_address as u64, sh.pointer_to_raw_data as u64, sh.size_of_raw_data as u64));
     }
+    regions.sort_by_key(|e| e.1);
 
-    // x86/x64: エントリポイントがjmpスタブの場合、ジャンプ先へ追従（範囲内のみ）
-    let mut code_start_offset: usize = 0;
-    if (pe.machine == 0x014c || pe.machine == 0x8664) && !in_headers {
-        if let Ok(first) = cs.disasm_count(&code, start_addr, 1) {
-            if let Some(i0) = first.iter().next() {
-                if i0.mnemonic() == Some("jmp") {
-                    if let Some(op) = i0.op_str() {
-                        if let Some(jmp_target_addr) = parse_hex_u64(op) {
-                            // Capstoneが返すオペランドは、ここではVA/RVA表示モードに従ったアドレス値のはず
-                            let jmp_target_rva = if use_va {
-                                jmp_target_addr.saturating_sub(image_base)
-                            } else {
-                                jmp_target_addr
-                            };
-                            if jmp_target_rva >= start_rva_in_image {
-                                let delta = (jmp_target_rva - start_rva_in_image) as usize;
-                                if delta < code.len() {
-                                    code_start_offset = delta;
-                                    start_addr = if use_va { image_base + jmp_target_rva } else { jmp_target_rva };
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let code_view = &code[code_start_offset..];
-    let insns = if let Some(n) = limit { cs.disasm_count(code_view, start_addr, n)? } else { cs.disasm_all(code_view, start_addr)? };
-    for i in insns.iter() {
-        let mut op = i.op_str().unwrap_or("").to_string();
-        let addr = i.address();
-        let sym = labels.range(..=addr).next_back();
-        let addr_str = if use_va {
-            if is_pe32_plus {
-                if let Some((sym_addr, name)) = sym {
-                    let off = addr.saturating_sub(*sym_addr);
-                    if off == 0 { format!("0x{:016X} <{}>", addr, name) }
-                    else { format!("0x{:016X} <{}+0x{:X}>", addr, name, off) }
-                } else {
-                    format!("0x{:016X}", addr)
-                }
-            } else {
-                if let Some((sym_addr, name)) = sym {
-                    let off = addr.saturating_sub(*sym_addr);
-                    if off == 0 { format!("0x{:08X} <{}>", addr as u32, name) }
-                    else { format!("0x{:08X} <{}+0x{:X}>", addr as u32, name, off) }
-                } else {
-                    format!("0x{:08X}", addr as u32)
-                }
-            }
-        } else {
-            // RVAは32bit幅で表示
-            if let Some((sym_addr, name)) = sym {
-                let off = addr.saturating_sub(*sym_addr);
-                if off == 0 { format!("0x{:08X} <{}>", addr as u32, name) }
-                else { format!("0x{:08X} <{}+0x{:X}>", addr as u32, name, off) }
-            } else {
-                format!("0x{:08X}", addr as u32)
-            }
-        };
-
-        fn parse_first_hex_u64(s: &str) -> Option<u64> {
-            let bytes = s.as_bytes();
-            let mut i = 0usize;
-            while i + 2 <= bytes.len() {
-                if bytes[i] == b'0' && (bytes[i + 1] == b'x' || bytes[i + 1] == b'X') {
-                    let mut j = i + 2;
-                    let mut digits = String::new();
-                    while j < bytes.len() {
-                        let c = bytes[j] as char;
-                        if c.is_ascii_whitespace() {
-                            j += 1;
-                            continue;
-                        }
-                        if c.is_ascii_hexdigit() {
-                            digits.push(c);
-                            j += 1;
-                            continue;
-                        }
-                        break;
-                    }
-                    if !digits.is_empty() {
-                        if let Ok(v) = u64::from_str_radix(&digits, 16) {
-                            return Some(v);
-                        }
-                    }
-                }
-                i += 1;
-            }
-
-            // 0x... が無い場合の救済: 十分長い16進数列(例: 1400010c0)を拾う
-            let mut best: Option<String> = None;
-            let mut run = String::new();
-            for c in s.chars() {
-                if c.is_ascii_hexdigit() {
-                    run.push(c);
-                } else {
-                    if run.len() >= 8 {
-                        best = Some(run.clone());
-                        break;
-                    }
-                    run.clear();
-                }
-            }
-            if best.is_none() && run.len() >= 8 {
-                best = Some(run);
-            }
-            if let Some(d) = best {
-                return u64::from_str_radix(&d, 16).ok();
-            }
-
-            None
+    for (name, va_rva_start, file_off, raw_len) in regions {
+        let (mut region_start_rva, mut region_file_off, mut region_len) = (va_rva_start, file_off, raw_len);
+        let mut region_start_addr = if use_va { image_base + region_start_rva } else { region_start_rva };
+        if is_thumb_mode {
+            region_start_addr |= 1;
         }
 
-        fn find_containing_range(ranges: &[(u64, u64)], addr: u64) -> Option<(u64, u64)> {
-            let mut lo = 0usize;
-            let mut hi = ranges.len();
-            while lo < hi {
-                let mid = (lo + hi) / 2;
-                if ranges[mid].0 <= addr { lo = mid + 1; } else { hi = mid; }
+        // --disasm-start 指定時は、そのアドレスより前のリージョンはスキップ。
+        if disasm_start.is_some() {
+            let region_end_rva = region_start_rva.saturating_add(region_len);
+            if start_rva_in_image >= region_end_rva {
+                continue;
             }
-            if lo == 0 { return None; }
-            let (start, end) = ranges[lo - 1];
-            if addr >= start && addr < end { Some((start, end)) } else { None }
         }
 
-        fn resolve_func_label_in_range(
-            labels: &BTreeMap<u64, String>,
-            range_start: u64,
-            range_end: u64,
-            target: u64,
-        ) -> Option<(u64, &str)> {
-            if target < range_start {
-                return None;
+        // start_rva は「そのリージョン内に含まれる場合のみ」適用（他リージョンは先頭から）
+        let region_end_rva = region_start_rva.saturating_add(region_len);
+        if start_rva_in_image >= region_start_rva && start_rva_in_image < region_end_rva {
+            let delta = start_rva_in_image - region_start_rva;
+            region_start_rva = start_rva_in_image;
+            region_file_off = region_file_off.saturating_add(delta);
+            region_len = region_len.saturating_sub(delta);
+            region_start_addr = if use_va { image_base + region_start_rva } else { region_start_rva };
+            if is_thumb_mode {
+                region_start_addr |= 1;
             }
-
-            // まずは「範囲内で target 以下の直前ラベル」を採用（関数先頭のPublic/Procedureがあるケースが多い）
-            if let Some((addr, name)) = labels.range(range_start..=target).next_back() {
-                if *addr < range_end {
-                    return Some((*addr, name.as_str()));
-                }
-            }
-
-            // それも無ければ、範囲内の先頭ラベル
-            labels
-                .range(range_start..range_end)
-                .next()
-                .map(|(addr, name)| (*addr, name.as_str()))
         }
 
-        fn is_jcc(m: &str) -> bool {
-            matches!(
-                m,
-                "je" | "jne" | "jz" | "jnz" | "ja" | "jae" | "jb" | "jbe" | "jg" | "jge" | "jl" | "jle" | "js" | "jns" | "jo" | "jno" | "jp" | "jnp" | "jc" | "jnc" | "jcxz" | "jecxz" | "jrcxz"
-            )
+        if region_len == 0 {
+            continue;
         }
 
-        let mnem = i.mnemonic().unwrap_or("");
-        if mnem == "call" || mnem == "jmp" || is_jcc(mnem) {
-            // call/jmp/jcc qword ptr [rip + 0x....] のような間接分岐は、0x... がdisplacementであり
-            // 分岐先アドレスではないため、即値パースを行わない。
-            let mut resolved_target: Option<u64> = if op.contains("[rip") {
-                None
-            } else {
-                parse_first_hex_u64(&op)
-            };
-            let mut indirect_mem_va: Option<u64> = None;
-            if resolved_target.is_none() {
-                // call/jmp/jcc qword ptr [rip +/- disp] の場合、IAT等のポインタを読んで解決
-                if op.contains("[rip") {
-                    if let Some(disp) = parse_rip_disp_u64(&op) {
-                        let insn_size = i.bytes().len() as u64;
-                        if insn_size != 0 {
-                            let rip = i.address().wrapping_add(insn_size);
-                            let mem_va = if disp >= 0 {
-                                rip.wrapping_add(disp as u64)
-                            } else {
-                                rip.wrapping_sub((-disp) as u64)
-                            };
-                            indirect_mem_va = Some(mem_va);
-                            if let Some(ptr) = read_u64_at_va(&file, mem_va, image_base, use_va, &section_list) {
-                                // ptr が実関数アドレスとして .pdata 範囲に入る場合だけ採用。
-                                // ファイル上のIATは IMAGE_IMPORT_BY_NAME へのRVA などになりがちで、
-                                // それをターゲット扱いすると誤判定で表示が出なくなる。
-                                if ptr != 0 {
-                                    if find_containing_range(&runtime_funcs, ptr).is_some() {
-                                        resolved_target = Some(ptr);
+        file.seek(SeekFrom::Start(region_file_off))?;
+        let mut code: Vec<u8> = vec![0u8; region_len.min(usize::MAX as u64) as usize];
+        if file.read_exact(&mut code).is_err() {
+            continue;
+        }
+
+        println!("\n[disasm] region='{}' start=0x{:X} len=0x{:X}", name, region_start_addr, region_len);
+
+        let mut code_start_offset: usize = 0;
+        if pe.machine == 0x014c || pe.machine == 0x8664 {
+            if let Ok(first) = cs.disasm_count(&code, region_start_addr, 1) {
+                if let Some(i0) = first.iter().next() {
+                    if i0.mnemonic() == Some("jmp") {
+                        if let Some(op) = i0.op_str() {
+                            if let Some(jmp_target_addr) = parse_hex_u64(op) {
+                                let jmp_target_rva = if use_va { jmp_target_addr.saturating_sub(image_base) } else { jmp_target_addr };
+                                if jmp_target_rva >= region_start_rva {
+                                    let delta = (jmp_target_rva - region_start_rva) as usize;
+                                    if delta < code.len() {
+                                        code_start_offset = delta;
+                                        region_start_addr = if use_va { image_base + jmp_target_rva } else { jmp_target_rva };
                                     }
                                 }
                             }
@@ -1107,39 +903,216 @@ fn disassemble_text(
                     }
                 }
             }
+        }
 
-            if let Some(target_addr) = resolved_target {
-                if let Some((rstart, _rend)) = find_containing_range(&runtime_funcs, target_addr) {
-                    if let Some((sym_addr, name)) = resolve_func_label_in_range(&labels, rstart, _rend, target_addr) {
-                        let off = target_addr.saturating_sub(sym_addr);
+        let code_view = &code[code_start_offset..];
+        // --disasm-limit はリージョン毎の上限として扱う
+        let insns = if let Some(n) = limit {
+            cs.disasm_count(code_view, region_start_addr, n)?
+        } else {
+            cs.disasm_all(code_view, region_start_addr)?
+        };
+
+        for i in insns.iter() {
+            let mut op = i.op_str().unwrap_or("").to_string();
+            let addr = i.address();
+            let sym = labels.range(..=addr).next_back();
+            let addr_str = if use_va {
+                if is_pe32_plus {
+                    if let Some((sym_addr, name)) = sym {
+                        let off = addr.saturating_sub(*sym_addr);
+                        if off == 0 { format!("0x{:016X} <{}>", addr, name) }
+                        else { format!("0x{:016X} <{}+0x{:X}>", addr, name, off) }
+                    } else {
+                        format!("0x{:016X}", addr)
+                    }
+                } else {
+                    if let Some((sym_addr, name)) = sym {
+                        let off = addr.saturating_sub(*sym_addr);
+                        if off == 0 { format!("0x{:08X} <{}>", addr as u32, name) }
+                        else { format!("0x{:08X} <{}+0x{:X}>", addr as u32, name, off) }
+                    } else {
+                        format!("0x{:08X}", addr as u32)
+                    }
+                }
+            } else {
+                // RVAは32bit幅で表示
+                if let Some((sym_addr, name)) = sym {
+                    let off = addr.saturating_sub(*sym_addr);
+                    if off == 0 { format!("0x{:08X} <{}>", addr as u32, name) }
+                    else { format!("0x{:08X} <{}+0x{:X}>", addr as u32, name, off) }
+                } else {
+                    format!("0x{:08X}", addr as u32)
+                }
+            };
+
+            fn parse_first_hex_u64(s: &str) -> Option<u64> {
+                let bytes = s.as_bytes();
+                let mut i = 0usize;
+                while i + 2 <= bytes.len() {
+                    if bytes[i] == b'0' && (bytes[i + 1] == b'x' || bytes[i + 1] == b'X') {
+                        let mut j = i + 2;
+                        let mut digits = String::new();
+                        while j < bytes.len() {
+                            let c = bytes[j] as char;
+                            if c.is_ascii_whitespace() {
+                                j += 1;
+                                continue;
+                            }
+                            if c.is_ascii_hexdigit() {
+                                digits.push(c);
+                                j += 1;
+                                continue;
+                            }
+                            break;
+                        }
+                        if !digits.is_empty() {
+                            if let Ok(v) = u64::from_str_radix(&digits, 16) {
+                                return Some(v);
+                            }
+                        }
+                    }
+                    i += 1;
+                }
+
+                // 0x... が無い場合の救済: 十分長い16進数列(例: 1400010c0)を拾う
+                let mut best: Option<String> = None;
+                let mut run = String::new();
+                for c in s.chars() {
+                    if c.is_ascii_hexdigit() {
+                        run.push(c);
+                    } else {
+                        if run.len() >= 8 {
+                            best = Some(run.clone());
+                            break;
+                        }
+                        run.clear();
+                    }
+                }
+                if best.is_none() && run.len() >= 8 {
+                    best = Some(run);
+                }
+                if let Some(d) = best {
+                    return u64::from_str_radix(&d, 16).ok();
+                }
+
+                None
+            }
+
+            fn find_containing_range(ranges: &[(u64, u64)], addr: u64) -> Option<(u64, u64)> {
+                let mut lo = 0usize;
+                let mut hi = ranges.len();
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    if ranges[mid].0 <= addr { lo = mid + 1; } else { hi = mid; }
+                }
+                if lo == 0 { return None; }
+                let (start, end) = ranges[lo - 1];
+                if addr >= start && addr < end { Some((start, end)) } else { None }
+            }
+
+            fn resolve_func_label_in_range(
+                labels: &BTreeMap<u64, String>,
+                range_start: u64,
+                range_end: u64,
+                target: u64,
+            ) -> Option<(u64, &str)> {
+                if target < range_start {
+                    return None;
+                }
+
+                // まずは「範囲内で target 以下の直前ラベル」を採用（関数先頭のPublic/Procedureがあるケースが多い）
+                if let Some((addr, name)) = labels.range(range_start..=target).next_back() {
+                    if *addr < range_end {
+                        return Some((*addr, name.as_str()));
+                    }
+                }
+
+                // それも無ければ、範囲内の先頭ラベル
+                labels
+                    .range(range_start..range_end)
+                    .next()
+                    .map(|(addr, name)| (*addr, name.as_str()))
+            }
+
+            fn is_jcc(m: &str) -> bool {
+                matches!(
+                    m,
+                    "je" | "jne" | "jz" | "jnz" | "ja" | "jae" | "jb" | "jbe" | "jg" | "jge" | "jl" | "jle" | "js" | "jns" | "jo" | "jno" | "jp" | "jnp" | "jc" | "jnc" | "jcxz" | "jecxz" | "jrcxz"
+                )
+            }
+
+            let mnem = i.mnemonic().unwrap_or("");
+            if mnem == "call" || mnem == "jmp" || is_jcc(mnem) {
+                // call/jmp/jcc qword ptr [rip + 0x....] のような間接分岐は、0x... がdisplacementであり
+                // 分岐先アドレスではないため、即値パースを行わない。
+                let mut resolved_target: Option<u64> = if op.contains("[rip") {
+                    None
+                } else {
+                    parse_first_hex_u64(&op)
+                };
+                let mut indirect_mem_va: Option<u64> = None;
+                if resolved_target.is_none() {
+                    // call/jmp/jcc qword ptr [rip +/- disp] の場合、IAT等のポインタを読んで解決
+                    if op.contains("[rip") {
+                        if let Some(disp) = parse_rip_disp_u64(&op) {
+                            let insn_size = i.bytes().len() as u64;
+                            if insn_size != 0 {
+                                let rip = i.address().wrapping_add(insn_size);
+                                let mem_va = if disp >= 0 {
+                                    rip.wrapping_add(disp as u64)
+                                } else {
+                                    rip.wrapping_sub((-disp) as u64)
+                                };
+                                indirect_mem_va = Some(mem_va);
+                                if let Some(ptr) = read_u64_at_va(&file, mem_va, image_base, use_va, &section_list) {
+                                    // ptr が実関数アドレスとして .pdata 範囲に入る場合だけ採用。
+                                    // ファイル上のIATは IMAGE_IMPORT_BY_NAME へのRVA などになりがちで、
+                                    // それをターゲット扱いすると誤判定で表示が出なくなる。
+                                    if ptr != 0 {
+                                        if find_containing_range(&runtime_funcs, ptr).is_some() {
+                                            resolved_target = Some(ptr);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if let Some(target_addr) = resolved_target {
+                    if let Some((rstart, _rend)) = find_containing_range(&runtime_funcs, target_addr) {
+                        if let Some((sym_addr, name)) = resolve_func_label_in_range(&labels, rstart, _rend, target_addr) {
+                            let off = target_addr.saturating_sub(sym_addr);
+                            if off == 0 { op = format!("{} <{}>", op, name); }
+                            else { op = format!("{} <{}+0x{:X}>", op, name, off); }
+                        } else {
+                            op = format!("{} <0x{:X}>", op, target_addr);
+                        }
+                    } else if let Some(name) = labels.get(&target_addr) {
+                        op = format!("{} <{}>", op, name);
+                    } else if let Some((sym_addr, name)) = labels.range(..=target_addr).next_back() {
+                        let off = target_addr.saturating_sub(*sym_addr);
                         if off == 0 { op = format!("{} <{}>", op, name); }
                         else { op = format!("{} <{}+0x{:X}>", op, name, off); }
                     } else {
                         op = format!("{} <0x{:X}>", op, target_addr);
                     }
-                } else if let Some(name) = labels.get(&target_addr) {
-                    op = format!("{} <{}>", op, name);
-                } else if let Some((sym_addr, name)) = labels.range(..=target_addr).next_back() {
-                    let off = target_addr.saturating_sub(*sym_addr);
-                    if off == 0 { op = format!("{} <{}>", op, name); }
-                    else { op = format!("{} <{}+0x{:X}>", op, name, off); }
-                } else {
-                    op = format!("{} <0x{:X}>", op, target_addr);
-                }
-            } else if let Some(mem_va) = indirect_mem_va {
-                // IAT等: ファイル上ではポインタ値が0で解決できないことがある。
-                // その場合でも __imp_... のようなラベルがあれば表示する。
-                if let Some(name) = labels.get(&mem_va) {
-                    op = format!("{} <{}>", op, name);
-                } else if let Some(name) = iat_names.get(&mem_va) {
-                    op = format!("{} <{}>", op, name);
-                } else {
-                    op = format!("{} <0x{:X}>", op, mem_va);
+                } else if let Some(mem_va) = indirect_mem_va {
+                    // IAT等: ファイル上ではポインタ値が0で解決できないことがある。
+                    // その場合でも __imp_... のようなラベルがあれば表示する。
+                    if let Some(name) = labels.get(&mem_va) {
+                        op = format!("{} <{}>", op, name);
+                    } else if let Some(name) = iat_names.get(&mem_va) {
+                        op = format!("{} <{}>", op, name);
+                    } else {
+                        op = format!("{} <0x{:X}>", op, mem_va);
+                    }
                 }
             }
-        }
 
-        println!("{}:  {:7} {}", addr_str, i.mnemonic().unwrap_or(""), op);
+            println!("{}:  {:7} {}", addr_str, i.mnemonic().unwrap_or(""), op);
+        }
     }
 
     Ok(())
